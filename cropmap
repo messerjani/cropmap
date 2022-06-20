@@ -1,0 +1,410 @@
+var LUCASlupts = ee.FeatureCollection("users/messerjanos/optain/LUCASpts_OPTAIN"),
+var catchments = ee.FeatureCollection("users/messerjanos/optain/catchments_OPTAIN"),
+var fieldboundaries = ee.FeatureCollection("users/messerjanos/optain/fieldboundaries_OPTAIN");
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+// Developer: Janos Meszaros - 2022
+// Contact: meszaros.janos@atk.hu
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+// USER DEFINED PARAMETERS
+
+// EASY MODE
+// Choose the catchment to process by copying its name to the "catAreaName" variable: 
+// Schwarzer_Schops, Petite_Glane, Csorsza, Felso_Valicka, Upper_Zglowiaczka, Pesnica,
+// Kebele_Kobiljski, La_Wimbe, Dotnuvele, Cherio, Krakstad, Tetves, Cechticky, Dviete, Savjaan
+var catAreaName = 'Savjaan';
+
+// ADVANCED MODE
+// You can change here some parameters if you want to tweak with them,
+// legend:
+// [5,44,30000,4,5]
+// 5: integer number - starting week of the year for the crop season
+// 44: integer number - ending week of the year for the crop season
+// 30000: integer number - local buffer radius (in meter) around CS polygon to define area where
+//  LUCAS points are collected for training data e.g. 30000 define a 30 km buffer
+// 4: integer number - length of period in weeks to collect satellite image for and slice whole period
+//  defined with the first two numbers
+// 5: integer number - spatial resolution (in meter) of the final cropmap raster
+var catchmentUserD = ee.Dictionary({
+  Schwarzer_Schops: [5,44,30000,4,5],
+  Petite_Glane: [5,44,30000,4,5],
+  Csorsza: [5,44,30000,4,5],
+  Felso_Valicka: [5,44,30000,4,5],
+  Upper_Zglowiaczka: [5,40,30000,4,5],
+  Pesnica: [5,44,30000,4,5],
+  Kebele_Kobiljski: [5,44,30000,4,5],
+  La_Wimbe: [5,44,30000,4,5],
+  Dotnuvele: [5,40,30000,4,5],
+  Cherio: [5,44,30000,4,5],
+  Krakstad: [5,44,30000,4,5],
+  Tetves: [5,44,30000,4,5],
+  Cechticky: [5,40,30000,4,5],
+  Dviete: [5,44,30000,4,5],
+  Savjaan: [5,44,30000,4,5]
+});
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// Please, do not modify code starting from this line. Thank you.
+// If you accidentaly modified it indeed and now you experience erratic operation,
+// please contact János Mészáros on his email address: meszaros.janos@atk.hu
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// 0. Global variables and functions
+// dictionary with catchments related hard-coded data
+var catchmentD = ee.Dictionary({
+  Schwarzer_Schops: ['Schwarzer_Schöps',2015,2021,40,48],
+  Petite_Glane: ['Schwarzer_Schöps',2017,2021,40,48],
+  Csorsza: ['Csorsza',2015,2021,40,48],
+  Felso_Valicka: ['Felso_Valicka',2015,2021,40,48],
+  Upper_Zglowiaczka: ['Upper_Zglowiaczka',2015,2021,40,48],
+  Pesnica: ['Pesnica',2015,2021,40,48],
+  Kebele_Kobiljski: ['Kebele_Kobiljski',2015,2021,40,48],
+  La_Wimbe: ['La_Wimbe',2017,2021,48,48],
+  Dotnuvele: ['Dotnuvele',2015,2021,40,48],
+  Cherio: ['Cherio',2017,2021,40,48],
+  Krakstad: ['Dotnuvele',2015,2021,40,48],
+  Tetves: ['Tetves',2015,2021,40,48],
+  Cechticky: ['Cechticky',2015,2021,40,48],
+  Dviete: ['Dviete',2015,2021,40,48],
+  Savjaan: ['Savjaan',2015,2021,40,48]
+});
+
+// random seed
+var seed = 123;
+
+// Sentinel-1 image collection
+var S1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+.filter(ee.Filter.eq('instrumentMode', 'IW'));
+
+// function for Sentinel-1 image pre-processing
+var sentinel = function(img) {
+  // masking edges from SAR image
+  var edge = img.lt(-30.0);
+  var maskedImage = img.mask().and(edge.not());
+  img = img.updateMask(maskedImage);
+  // adding polarization ratio band
+  img = img.addBands(img.expression('VH / VV', {
+    'VH': img.select('VH'),
+    'VV': img.select('VV'),
+  }).rename('VH_VV_ratio'));
+  
+  var finalImage = img.select(['VV', 'VH', 'VH_VV_ratio']);
+  
+  return finalImage;
+};
+
+// catchment area filtering
+var catArea = catchments.filter(ee.Filter.stringContains('name', catAreaName));
+// defining crop samples area + specified buffer in dictionary
+// satellite images will be clipped for this area
+var cropArea = catArea.geometry()
+.buffer({distance: ee.List(catchmentUserD.get(catAreaName)).get(2)});
+// field boundaries
+var fieldBounds = fieldboundaries.filter(ee.Filter.stringContains('name', catAreaName));
+
+// map options
+Map.setOptions('HYBRID');
+Map.centerObject(catArea);
+
+// week step and total period to generate weeks for
+var weekStep = ee.List(catchmentUserD.get(catAreaName)).get(3);
+var weeks = ee.List.sequence(ee.List(catchmentUserD.get(catAreaName)).get(0), ee.List(catchmentUserD.get(catAreaName)).get(1), weekStep);
+var beforeweeks = ee.List.sequence(ee.List(catchmentD.get(catAreaName)).get(3), ee.List(catchmentD.get(catAreaName)).get(4), weekStep);
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// I. Training data collection
+var lucasPeriod = ee.List([2015, 2018]);
+
+// catchment area filtering
+var catAreaTrain = catchments.filter(ee.Filter.stringContains('name', ee.List(catchmentD.get(catAreaName)).get(0)));
+// defining crop samples area + specified buffer
+// satellite images will be clipped for this area
+var cropAreaTrain = catAreaTrain.geometry()
+.buffer({distance: ee.List(catchmentUserD.get(catAreaName)).get(2)});
+
+var sampleDataL = lucasPeriod.map(function(y) {
+  // selecting LUCAS points for given year
+  var obsPts = LUCASlupts.filter(ee.Filter.eq('year', y))
+  .filterBounds(cropAreaTrain);
+  // creating time-series multiband images
+  // first image for period before actual year
+  var imgbeforeL = beforeweeks.map(function(w) {
+    var beforemonthFromWeek = ee.Number(w).divide(4.3).ceil();
+    var beforeweekDate = ee.Date.fromYMD(ee.Number(y).subtract(1),beforemonthFromWeek,1);
+    
+    var S1fTrain = S1.filterDate(beforeweekDate, beforeweekDate.advance(weekStep, 'week'))
+    .filterBounds(cropAreaTrain)
+    .map(sentinel);
+
+    return S1fTrain.median();
+  });
+  // second image for actual year
+  var imgL = weeks.map(function(w) {
+    var monthFromWeek = ee.Number(w).divide(4.3).ceil();
+    var weekDate = ee.Date.fromYMD(y,monthFromWeek,1);
+    
+    var S1fTrain = S1.filterDate(weekDate, weekDate.advance(weekStep, 'week'))
+    .filterBounds(cropAreaTrain)
+    .map(sentinel);
+
+    return S1fTrain.median();
+  });
+  // combine image list into a single multiband image for "before" and actual period
+  var empty = ee.Image().select();
+  var imgMBbefore = imgbeforeL.iterate(function(img, result) {return ee.Image(result).addBands(img);}, empty);
+  imgMBbefore = ee.Image(imgMBbefore);
+  var imgMB = imgL.iterate(function(img, result) {return ee.Image(result).addBands(img);}, empty);
+  imgMB = ee.Image(imgMB);
+  
+  imgMB = ee.Image([imgMBbefore, imgMB]);
+  imgMB = imgMB.clip(cropAreaTrain);
+  
+  // defining predictor variables present in satellite image mosaic
+  var bands = imgMB.bandNames();
+  // collecting training data
+  var samplesy = imgMB.select(bands).sampleRegions({
+    collection: obsPts,
+    properties: ['lc1'],
+    scale: ee.List(catchmentUserD.get(catAreaName)).get(4),
+    tileScale: 16
+  });
+
+  return samplesy;
+});
+
+// merging yearly sample data into one big feature collection
+var sampleData = ee.FeatureCollection(sampleDataL.get(0))
+  .merge(ee.FeatureCollection(sampleDataL.get(1)));
+
+// printing number of sample points
+print('Number of LUCAS observation points: ', sampleData.size());
+// prediction variables from the sample data
+var predvar = sampleData.first().propertyNames().slice(1);
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// II. Building and testing classifier model
+// set of random numbers
+var randomL = ee.List([13]);
+var splitL = ee.List.sequence(0.0, 0.9, 0.1);
+
+var crossVal = randomL.map(function(cvseed) {
+  // adding random values to samples
+  var sampleDataCV = sampleData.randomColumn('random', cvseed);
+  
+  //10-fold cross validation in one iteration
+  return splitL.map(function(splitter) {
+    var split_min = ee.Number(splitter);
+    var split_max = ee.Number(splitter).add(0.1);
+    var testData = sampleDataCV.filter(ee.Filter.gte('random', split_min)).filter(ee.Filter.lt('random', split_max));
+    var trainMin = sampleDataCV.filter(ee.Filter.lt('random', split_min));
+    var trainMax = sampleDataCV.filter(ee.Filter.gte('random', split_max));
+    var trainData = trainMin.merge(trainMax);
+    
+    // gradient boosting training
+    var rfm = ee.Classifier.smileGradientTreeBoost({
+      numberOfTrees: 150,
+      seed: cvseed
+    })
+    .setOutputMode('CLASSIFICATION')
+    .train({
+      features: trainData,
+      classProperty: 'lc1',
+      inputProperties: predvar
+    });
+    
+    
+    // testing Random Forest model using dataset table
+    // listing represented unique landuse IDs
+    var emptyL = ee.List([]);
+    var cropIDL = ee.List(testData.iterate(function(cID, result) {return ee.List(result).add(cID.get('lc1'));}, emptyL)).distinct();
+    cropIDL = cropIDL.sort();
+    
+    // test and confusion matrix
+    var testErrorMatrix = testData.classify(rfm)
+    .errorMatrix('lc1', 'classification', cropIDL)
+    .array();
+    
+    // kappa
+    var testKappa = testData.classify(rfm)
+    .errorMatrix('lc1', 'classification')
+    .kappa();
+    
+    // total accuracy
+    var testAccuracy = testData.classify(rfm)
+    .errorMatrix('lc1', 'classification')
+    .accuracy();
+    
+    // consumer accuracy
+    var testConsumerAccuracy = testData.classify(rfm)
+    .errorMatrix('lc1', 'classification', cropIDL)
+    .consumersAccuracy();
+    testConsumerAccuracy = testConsumerAccuracy.toList().flatten();
+    
+    // producer accuracy
+    var testProducerAccuracy = testData.classify(rfm)
+    .errorMatrix('lc1', 'classification', cropIDL)
+    .producersAccuracy();
+    testProducerAccuracy = testProducerAccuracy.toList().flatten();
+    
+    // final features with accuracy metrics as properties
+    return ee.Feature(null, {
+      'confusionmatrix': testErrorMatrix,
+      'consumeraccuracy': testConsumerAccuracy,
+      'cropID': cropIDL,
+      'kappa': testKappa,
+      'produceraccuracy': testProducerAccuracy,
+      'totalaccuracy': testAccuracy
+    });
+  });
+}).flatten();
+
+crossVal = ee.FeatureCollection(crossVal);
+print('Accuracy metrics: ', crossVal);
+print('Mean accuracy of tests: ' , crossVal.aggregate_mean('totalaccuracy'));
+print('Mean kappa of tests: ' , crossVal.aggregate_mean('kappa'));
+
+// exporting accuracy metrics
+Export.table.toDrive({
+  collection: crossVal,
+  description: 'accuracymetricsToDriveCSV',
+  folder: 'OPTAIN_export',
+  fileFormat: 'CSV',
+  fileNamePrefix: catAreaName + '_accuracy_metrics'
+});
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// III. Classification on defined period
+// list with all years between start and end years
+var cmtimeFrame = ee.List.sequence(ee.List(catchmentD.get(catAreaName)).get(1), ee.List(catchmentD.get(catAreaName)).get(2), 1);
+
+// gradient boosting classifier training on all sample data
+var rfm = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 150,
+  seed: seed
+})
+.setOutputMode('CLASSIFICATION')
+.train({
+  features: sampleData,
+  classProperty: 'lc1',
+  inputProperties: predvar
+});
+
+// variable importance chart of the Random Forest model
+var varimp = ee.Feature(null, ee.Dictionary(rfm.explain().get('importance')));
+var varimpchart = ui.Chart.feature.byProperty(varimp)
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'RF Variable Importance',
+    legend: {position: 'none'},
+    hAxis: {title: 'Variables'},
+    vAxis: {title: 'Importance'}
+  });
+print (varimpchart);
+
+// generating cropmaps for defined years
+var cropmapL = cmtimeFrame.map(function(y) {
+  // creating time-series multiband images
+  // first image for period before actual year
+  var clfimgbeforeL = beforeweeks.map(function(w) {
+    var beforemonthFromWeek = ee.Number(w).divide(4.3).ceil();
+    var beforeweekDate = ee.Date.fromYMD(ee.Number(y).subtract(1),beforemonthFromWeek,1);
+    
+    var S1f = S1.filterDate(beforeweekDate, beforeweekDate.advance(weekStep, 'week'))
+    .filterBounds(cropAreaTrain)
+    .map(sentinel);
+
+    return S1f.median();
+  });
+  // second image for actual year
+  var clfimgL = weeks.map(function(w) {
+    var monthFromWeek = ee.Number(w).divide(4.3).ceil();
+    var weekDate = ee.Date.fromYMD(y,monthFromWeek,1);
+    
+    var S1f = S1.filterDate(weekDate, weekDate.advance(weekStep, 'week'))
+    .filterBounds(cropArea)
+    .map(sentinel);
+
+    return S1f.median();
+  });
+  
+  // combine image list into a single multiband image for "before" and actual period
+  var empty = ee.Image().select();
+  var clfimgMBbefore = clfimgbeforeL.iterate(function(img, result) {return ee.Image(result).addBands(img);}, empty);
+  clfimgMBbefore = ee.Image(clfimgMBbefore);
+  var clfimgMB = clfimgL.iterate(function(img, result) {return ee.Image(result).addBands(img);}, empty);
+  clfimgMB = ee.Image(clfimgMB);
+  
+  clfimgMB = ee.Image([clfimgMBbefore, clfimgMB]);
+  
+  // actual classification with pretrained RF model
+  var classified = clfimgMB.classify(rfm);
+  
+  // smoothing
+  var classifiedVect = classified.reduceRegions({
+    collection: fieldBounds,
+    reducer: 'mode', 
+    scale: ee.List(catchmentUserD.get(catAreaName)).get(4),
+    tileScale: 16
+  });
+  
+  var classifiedFilt = classifiedVect.reduceToImage({
+    properties: ee.List(['mode']),
+    reducer: 'mode'
+  });
+
+  return classifiedFilt;
+});
+
+// combine cropmap list into a single multiband cropmap image
+var empty = ee.Image().select();
+var cropmapMB = cropmapL.iterate(function(img, result) {return ee.Image(result).addBands(img);}, empty);
+cropmapMB = ee.Image(cropmapMB);
+// converting years number list to string list
+var cmtimeFrameStr = cmtimeFrame.map(function(ynum) {
+  return ee.String(ee.Number(ynum).int());
+});
+// renaming bands for years using previous years string list as new bandnames
+cropmapMB = cropmapMB.rename(cmtimeFrameStr);
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// IV. Visualizations
+// colorization palettes
+var classVis = {min: 1, max: 77, palette: ['white', 'green']};
+
+// first layer of cropmap
+Map.addLayer(cropmapMB.select(0), classVis, 'Cropmap', true, 1);
+
+// catchment
+Map.addLayer(catArea, {}, 'Catchment', false, 0.75);
+
+// fieldboundaries
+//Map.addLayer(fieldBounds, {}, 'Field boundaries', true, 1);
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// V. Exporting results
+// Cropmap raster stack export
+Export.image.toDrive({
+  image: cropmapMB,
+  description: 'cropmapStackToDriveGeoTiff',
+  fileNamePrefix: catAreaName + '_cropmaps' + ee.List(catchmentD.get(catAreaName)).get(1).getInfo() + '_' + ee.List(catchmentD.get(catAreaName)).get(2).getInfo(),
+  scale: ee.List(catchmentUserD.get(catAreaName)).get(4).getInfo(),
+  region: catArea,
+  folder: 'OPTAIN_export',
+  fileFormat: 'GeoTIFF',
+  maxPixels: 10e10,
+  crs: 'EPSG:3035',
+  skipEmptyTiles: true
+});
+
